@@ -1,0 +1,204 @@
+#!/usr/bin/python3
+from bpfcc import BPF
+from time import sleep
+from threading import Thread
+import os
+import signal
+import argparse
+import subprocess
+
+
+def positive_int(val):
+    try:
+        ival = int(val)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer")
+    if ival < 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return ival
+
+
+def positive_nonzero_int(val):
+    ival = positive_int(val)
+    if ival == 0:
+        raise argparse.ArgumentTypeError("must be nonzero")
+    return ival
+
+
+examples = """
+trace_alloc_pages               # Output statistics of different processes
+trace_alloc_pages -n sec        # Seconds to wait between updates, default set to 1
+trace_alloc_pages -d            # Directly output each call information
+trace_alloc_pages -p pid -n sec # Only the statistical information of the specified process is output, with threads as the unit
+trace_alloc_pages -d -p pid     # Output each call information of the specified process
+"""
+
+parser = argparse.ArgumentParser(
+    description="Summarize alloc_pages call information",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+
+parser.add_argument("-d",
+                    "--detail",
+                    action="store_true",
+                    help="output each call information")
+parser.add_argument("-p",
+                    "--pid",
+                    type=positive_nonzero_int,
+                    help="trace this PID only")
+args = parser.parse_args()
+
+# prog text
+with open("./alloc_pages_prog", "r", encoding='utf-8') as file:
+    prog = file.read()
+
+# param
+filter = "0"
+process_id = 0
+if (args.pid):
+    process_id = int(args.pid)
+    filter = 'pid != %d' % process_id
+prog = prog.replace('FILTER', filter)
+
+# load BPF program
+b = BPF(text=prog)
+b.attach_kprobe(event="alloc_pages", fn_name="start_alloc_pages")
+b.attach_kretprobe(event="alloc_pages", fn_name="ret_alloc_pages")
+
+# program start time
+start = 0
+# program running flag
+running = 1
+# info per process
+process_info = {}
+# info per thread
+thread_info = {}
+
+
+class ProcessInfo:
+
+    def __init__(self, pid, comm):
+        self.pid = pid
+        self.comm = comm
+        self.success = 0
+        self.fail = 0
+        self.time = 0
+
+
+class ThreadInfo:
+
+    def __init__(self, pid, tid, comm):
+        self.pid = pid
+        self.tid = tid
+        self.comm = comm
+        self.success = 0
+        self.fail = 0
+        self.time = 0
+
+
+def print_detail_header():
+    print("%-10s %-6s %-6s %-10s %-6s %-10s  %-40s" %
+          ("TIME(s)", "PID", "TID", "MASK", "PAGES", "POINTER", "COMMAND"))
+
+
+def print_process_header():
+    print("%-6s %-8s %-6s %-6s %-40s" %
+          ("PID", "SUCCESS", "FAIL", "ALL", "COMMAND"))
+
+
+def print_thread_header():
+    print("%-6s %-6s %-8s %-6s %-6s %-40s" %
+          ("PID", "TID", "SUCCESS", "FAIL", "ALL", "COMMAND"))
+
+
+def print_detail(event):
+    global start
+    if start == 0:
+        start = event.time
+    time_s = (float(event.time - start)) / 1000000000
+    print("%-10.3f %-6d %-6d %#-10x %-6d %#-10x %-40s" %
+          (time_s, event.pid, event.tid, event.gfp_mask, event.pages,
+           event.ptr, event.comm.decode('utf-8')))
+
+
+def print_process():
+    global process_info
+    subprocess.call('clear')
+    print_process_header()
+    process_all = [v for v in process_info.values()]
+    process_all.sort(key=lambda x: x.time, reverse=True)
+    for v in process_all:
+        print("%-6d %-8d %-6d %-6d %-40s" %
+              (v.pid, v.success, v.fail, v.success + v.fail, v.comm))
+
+
+def print_thread():
+    global thread_info
+    subprocess.call('clear')
+    print_thread_header()
+    thread_all = [v for v in thread_info.values()]
+    thread_all.sort(key=lambda x: x.time, reverse=True)
+    for v in thread_all:
+        print("%-6d %-6d %-8d %-6d %-6d %-40s" %
+              (v.pid, v.tid, v.success, v.fail, v.success + v.fail, v.comm))
+
+
+class PrintThread(Thread):
+
+    def __init(self):
+        Thread.__init__(self)
+
+    def run(self):
+        global running, process_id
+        if (args.detail):
+            return
+        while (running):
+            if (process_id != 0):
+                print_thread()
+            else:
+                print_process()
+            sleep(1)
+
+
+def process_event(cpu, data, size):
+    global process_info, thread_info, process_id
+    event = b["alloc_pages_events"].event(data)
+    if (args.detail):
+        # print per event
+        print_detail(event)
+    elif (process_id != 0):
+        # print per thread
+        thread = thread_info.get(
+            event.tid,
+            ThreadInfo(event.pid, event.tid, event.comm.decode('utf-8')))
+        thread.time = event.time
+        if (event.ptr):
+            thread.success += event.pages
+        else:
+            thread.fail += event.pages
+        thread_info[event.tid] = thread
+    else:
+        # print per process
+        process = process_info.get(
+            event.pid, ProcessInfo(event.pid, event.comm.decode('utf-8')))
+        process.time = event.time
+        if (event.ptr):
+            process.success += event.pages
+        else:
+            process.fail += event.pages
+        process_info[event.pid] = process
+
+
+# loop with callback to print_event
+b["alloc_pages_events"].open_perf_buffer(process_event)
+try:
+    print_t = PrintThread()
+    print_t.start()
+    if (args.detail):
+        print_detail_header()
+    while running:
+        b.perf_buffer_poll()
+except KeyboardInterrupt:
+    running = 0
+    print("exiting...")
+    exit()

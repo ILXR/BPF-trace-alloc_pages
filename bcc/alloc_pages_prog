@@ -1,0 +1,73 @@
+#include <linux/sched.h>
+#include <linux/types.h>
+#include <linux/mm_types.h>
+#include <linux/mm.h>
+
+#ifndef TASK_COMM_LEN
+#define TASK_COMM_LEN 40
+#endif
+
+BPF_PERF_OUTPUT(alloc_pages_events);
+
+// define output data structure in C
+struct event_t
+{
+    u32 pid, tid;             // id
+    u32 enter;                // start alloc_pages
+    u32 gfp_mask, pages;      // args
+    u64 time;                 // timestamp
+    u32 ptr;                  // ret: struct page
+    char comm[TASK_COMM_LEN]; // command
+};
+
+// tid - event_t for debug output
+BPF_HASH(id_to_event_t, u64, struct event_t);
+
+int start_alloc_pages(struct pt_regs *ctx, gfp_t gfp_mask, unsigned int order)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (FILTER)
+        return 0;
+
+    struct event_t data = {};
+    data.enter = 1;
+    data.pid = pid;
+    data.tid = id;
+    data.time = bpf_ktime_get_ns();
+    data.gfp_mask = gfp_mask;
+    data.pages = 1 << order;
+    bpf_get_current_comm(&data.comm, TASK_COMM_LEN);
+
+    struct event_t *old_data = id_to_event_t.lookup(&id);
+    if (old_data && old_data->enter == 0)
+        id_to_event_t.update(&id, &data);
+    else
+        id_to_event_t.insert(&id, &data);
+
+    return 0;
+}
+
+int ret_alloc_pages(struct pt_regs *ctx)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    if (FILTER)
+        return 0;
+
+    struct event_t *old_data = id_to_event_t.lookup(&id);
+
+    if (old_data && old_data->enter == 1)
+    {
+        old_data->enter = 0;
+        // read struct page to stack
+        struct page tmp;
+        // bpf_probe_read_kernel(&tmp, sizeof(tmp), (struct page *)PT_REGS_RC(ctx));
+
+        old_data->ptr = PT_REGS_RC(ctx);
+        id_to_event_t.update(&id, old_data);
+        alloc_pages_events.perf_submit(ctx, old_data, sizeof(*old_data));
+    }
+
+    return 0;
+}
