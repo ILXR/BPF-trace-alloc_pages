@@ -3,7 +3,6 @@ from bpfcc import BPF
 from time import sleep
 from threading import Thread
 import os
-import signal
 import argparse
 import subprocess
 
@@ -27,11 +26,12 @@ def positive_nonzero_int(val):
 
 examples = """
 trace_alloc_pages               # Output statistics of different processes
-trace_alloc_pages -n sec        # Seconds to wait between updates, default set to 1
 trace_alloc_pages -d            # Directly output each call information
-trace_alloc_pages -p pid -n sec # Only the statistical information of the specified process is output, with threads as the unit
+trace_alloc_pages -s            # Print function call stack [kernel/user]
+trace_alloc_pages -p pid        # Only the statistical information of the specified process is output, with threads as the unit
 trace_alloc_pages -d -p pid     # Output each call information of the specified process
 """
+# trace_alloc_pages -n sec        # Seconds to wait between updates, default set to 1
 
 parser = argparse.ArgumentParser(
     description="Summarize alloc_pages call information",
@@ -46,6 +46,14 @@ parser.add_argument("-p",
                     "--pid",
                     type=positive_nonzero_int,
                     help="trace this PID only")
+parser.add_argument("-s",
+                    "--stack",
+                    action="store_true",
+                    help="print user/kernel stack trace")
+parser.add_argument("-f",
+                    "--offset",
+                    action="store_true",
+                    help="print symbols in stack with offset")
 args = parser.parse_args()
 
 # prog text
@@ -55,6 +63,7 @@ with open("./alloc_pages_prog", "r", encoding='utf-8') as file:
 # param
 filter = "0"
 process_id = 0
+p_offset = args.offset
 if (args.pid):
     process_id = int(args.pid)
     filter = 'pid != %d' % process_id
@@ -63,7 +72,16 @@ prog = prog.replace('FILTER', filter)
 # load BPF program
 b = BPF(text=prog)
 b.attach_kprobe(event="alloc_pages", fn_name="start_alloc_pages")
-b.attach_kretprobe(event="alloc_pages", fn_name="ret_alloc_pages")
+'''
+kretprobe 会通过改变该函数在栈上存储的返回地址来实现跳转到注册的函数上
+所以会破坏栈结构，在解析栈内容时不能 attach kretprobe 类型的程序
+'''
+# b.attach_kretprobe(event="alloc_pages", fn_name="ret_alloc_pages")
+
+matched = b.num_open_kprobes()
+if matched == 0:
+    print("Function alloc_pages not found. Exiting.")
+    exit()
 
 # program start time
 start = 0
@@ -73,6 +91,8 @@ running = 1
 process_info = {}
 # info per thread
 thread_info = {}
+# call stack
+stack_traces = b.get_table("stack_traces")
 
 
 class ProcessInfo:
@@ -80,8 +100,7 @@ class ProcessInfo:
     def __init__(self, pid, comm):
         self.pid = pid
         self.comm = comm
-        self.success = 0
-        self.fail = 0
+        self.pages = 0
         self.time = 0
 
 
@@ -91,24 +110,21 @@ class ThreadInfo:
         self.pid = pid
         self.tid = tid
         self.comm = comm
-        self.success = 0
-        self.fail = 0
+        self.pages = 0
         self.time = 0
 
 
 def print_detail_header():
-    print("%-10s %-6s %-6s %-10s %-6s %-10s  %-40s" %
-          ("TIME(s)", "PID", "TID", "MASK", "PAGES", "POINTER", "COMMAND"))
+    print("%-10s %-6s %-6s %-10s %-6s %-40s" %
+          ("TIME(s)", "PID", "TID", "MASK", "PAGES", "COMMAND"))
 
 
 def print_process_header():
-    print("%-6s %-8s %-6s %-6s %-40s" %
-          ("PID", "SUCCESS", "FAIL", "ALL", "COMMAND"))
+    print("%-6s %-6s %-40s" % ("PID", "PAGES", "COMMAND"))
 
 
 def print_thread_header():
-    print("%-6s %-6s %-8s %-6s %-6s %-40s" %
-          ("PID", "TID", "SUCCESS", "FAIL", "ALL", "COMMAND"))
+    print("%-6s %-6s %-6s %-40s" % ("PID", "TID", "PAGES", "COMMAND"))
 
 
 def print_detail(event):
@@ -116,9 +132,29 @@ def print_detail(event):
     if start == 0:
         start = event.time
     time_s = (float(event.time - start)) / 1000000000
-    print("%-10.3f %-6d %-6d %#-10x %-6d %#-10x %-40s" %
+    print("%-10.3f %-6d %-6d %#-10x %-6d %-40s" %
           (time_s, event.pid, event.tid, event.gfp_mask, event.pages,
-           event.ptr, event.comm.decode('utf-8')))
+           event.comm.decode('utf-8')))
+    if (args.stack == False): return
+    if (event.k_stack_id >= 0):
+        for addr in stack_traces.walk(event.k_stack_id):
+            sym = b.ksym(addr, show_offset=p_offset).decode('utf-8', 'replace')
+            print("\t%s [kernel]" % sym)
+    if (event.u_stack_id >= 0):
+        unknown = False
+        try:
+            for addr in stack_traces.walk(event.u_stack_id):
+                sym = b.sym(addr, event.pid,
+                            show_offset=p_offset).decode('utf-8', 'replace')
+                if (sym == "[unknown]"):
+                    if (unknown == False): print("\t...")
+                    unknown = True
+                else:
+                    print("\t%s [user]" % sym)
+                    unknown = False
+        except:
+            pass
+    print()
 
 
 def print_process():
@@ -128,8 +164,7 @@ def print_process():
     process_all = [v for v in process_info.values()]
     process_all.sort(key=lambda x: x.time, reverse=True)
     for v in process_all:
-        print("%-6d %-8d %-6d %-6d %-40s" %
-              (v.pid, v.success, v.fail, v.success + v.fail, v.comm))
+        print("%-6d %-6d %-40s" % (v.pid, v.pages, v.comm))
 
 
 def print_thread():
@@ -139,14 +174,14 @@ def print_thread():
     thread_all = [v for v in thread_info.values()]
     thread_all.sort(key=lambda x: x.time, reverse=True)
     for v in thread_all:
-        print("%-6d %-6d %-8d %-6d %-6d %-40s" %
-              (v.pid, v.tid, v.success, v.fail, v.success + v.fail, v.comm))
+        print("%-6d %-6d %-6d %-40s" % (v.pid, v.tid, v.pages, v.comm))
 
 
 class PrintThread(Thread):
 
     def __init(self):
         Thread.__init__(self)
+        self.daemon = True
 
     def run(self):
         global running, process_id
@@ -172,20 +207,14 @@ def process_event(cpu, data, size):
             event.tid,
             ThreadInfo(event.pid, event.tid, event.comm.decode('utf-8')))
         thread.time = event.time
-        if (event.ptr):
-            thread.success += event.pages
-        else:
-            thread.fail += event.pages
+        thread.pages += event.pages
         thread_info[event.tid] = thread
     else:
         # print per process
         process = process_info.get(
             event.pid, ProcessInfo(event.pid, event.comm.decode('utf-8')))
         process.time = event.time
-        if (event.ptr):
-            process.success += event.pages
-        else:
-            process.fail += event.pages
+        process.pages += event.pages
         process_info[event.pid] = process
 
 
