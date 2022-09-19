@@ -2,3 +2,12 @@
 __pycache__
 
 tests/*.out
+
+# kernel module
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.order
+*.symvers

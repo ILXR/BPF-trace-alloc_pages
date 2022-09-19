@@ -138,19 +138,22 @@ def print_detail(event):
     if (args.stack == False): return
     if (event.k_stack_id >= 0):
         for addr in stack_traces.walk(event.k_stack_id):
-            sym = b.ksym(addr, show_offset=p_offset).decode('utf-8', 'replace')
-            print("\t%s [kernel]" % sym)
+            sym = b.ksym(addr, show_module=True,
+                         show_offset=p_offset).decode('utf-8', 'replace')
+            print("\t%s" % sym)
     if (event.u_stack_id >= 0):
         unknown = False
         try:
             for addr in stack_traces.walk(event.u_stack_id):
-                sym = b.sym(addr, event.pid,
+                sym = b.sym(addr,
+                            event.pid,
+                            show_module=True,
                             show_offset=p_offset).decode('utf-8', 'replace')
                 if (sym == "[unknown]"):
                     if (unknown == False): print("\t...")
                     unknown = True
                 else:
-                    print("\t%s [user]" % sym)
+                    print("\t%s" % sym)
                     unknown = False
         except:
             pass
